@@ -57,6 +57,9 @@
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_local_position_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/vehicle_command.h>
+#include <uORB/topics/vehicle_command_ack.h>
+#include <uORB/topics/commander_state.h>
 
 #include <float.h>
 #include <mathlib/mathlib.h>
@@ -103,9 +106,12 @@ private:
 	orb_advert_t	_att_sp_pub{nullptr};			/**< attitude setpoint publication */
 	orb_advert_t	_local_pos_sp_pub{nullptr};		/**< vehicle local position setpoint publication */
 	orb_id_t _attitude_setpoint_id{nullptr};
+	orb_advert_t _pub_vehicle_command_ack{nullptr};
 
 	int		_control_task{-1};			/**< task handle for task */
 	int		_vehicle_status_sub{-1};		/**< vehicle status subscription */
+	int		_commander_state_sub{-1};		/**< commander state subscription */
+	int		_vehicle_command_sub{-1};		/**< vehicle command subscription */
 	int		_vehicle_land_detected_sub{-1};	/**< vehicle land detected subscription */
 	int		_control_mode_sub{-1};		/**< vehicle control mode subscription */
 	int		_params_sub{-1};			/**< notification of parameter updates */
@@ -114,7 +120,8 @@ private:
 
 	float _takeoff_speed = -1.f; /**< For flighttask interface used only. It can be thrust or velocity setpoints */
 
-	vehicle_status_s 			_vehicle_status{}; 	/**< vehicle status */
+	commander_state_s 			_commander_state{}; 	/**< commander state */
+	vehicle_command_s 			_vehicle_command{}; 	/**< vehicle command */
 	vehicle_land_detected_s 			_vehicle_land_detected{};	/**< vehicle land detected */
 	vehicle_attitude_setpoint_s		_att_sp{};		/**< vehicle attitude setpoint */
 	vehicle_control_mode_s			_control_mode{};		/**< vehicle control mode */
@@ -235,6 +242,11 @@ private:
 	static int	task_main_trampoline(int argc, char *argv[]);
 
 	/**
+	 * send acknowledgement of vehicle command
+	 */
+	void send_command_ack(const vehicle_command_s &command, const uint8_t &cmd_result, const int &switch_result);
+
+	/**
 	 * Main sensor collection task.
 	 */
 	void		task_main();
@@ -326,20 +338,34 @@ MulticopterPositionControl::poll_subscriptions()
 {
 	bool updated;
 
-	orb_check(_vehicle_status_sub, &updated);
+	if (!_attitude_setpoint_id) {
 
-	if (updated) {
-		orb_copy(ORB_ID(vehicle_status), _vehicle_status_sub, &_vehicle_status);
+		orb_check(_vehicle_status_sub, &updated);
 
-		// set correct uORB ID, depending on if vehicle is VTOL or not
-		if (!_attitude_setpoint_id) {
-			if (_vehicle_status.is_vtol) {
+		if (updated) {
+			vehicle_status_s vehicle_status{};
+			orb_copy(ORB_ID(vehicle_status), _vehicle_status_sub, &vehicle_status);
+
+			// set correct uORB ID, depending on if vehicle is VTOL or not
+			if (vehicle_status.is_vtol) {
 				_attitude_setpoint_id = ORB_ID(mc_virtual_attitude_setpoint);
 
 			} else {
 				_attitude_setpoint_id = ORB_ID(vehicle_attitude_setpoint);
 			}
 		}
+	}
+
+	orb_check(_commander_state_sub, &updated);
+
+	if (updated) {
+		orb_copy(ORB_ID(commander_state), _commander_state_sub, &_commander_state);
+	}
+
+	orb_check(_vehicle_command_sub, &updated);
+
+	if (updated) {
+		orb_copy(ORB_ID(vehicle_command), _vehicle_command_sub, &_vehicle_command);
 	}
 
 	orb_check(_vehicle_land_detected_sub, &updated);
@@ -474,6 +500,8 @@ MulticopterPositionControl::task_main()
 {
 	// do subscriptions
 	_vehicle_status_sub = orb_subscribe(ORB_ID(vehicle_status));
+	_commander_state_sub = orb_subscribe(ORB_ID(commander_state));
+	_vehicle_command_sub = orb_subscribe(ORB_ID(vehicle_command));
 	_vehicle_land_detected_sub = orb_subscribe(ORB_ID(vehicle_land_detected));
 	_control_mode_sub = orb_subscribe(ORB_ID(vehicle_control_mode));
 	_params_sub = orb_subscribe(ORB_ID(parameter_update));
@@ -686,7 +714,7 @@ MulticopterPositionControl::start_flight_task()
 	bool task_failure = false;
 
 	// offboard
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_OFFBOARD
 	    && (_control_mode.flag_control_altitude_enabled ||
 		_control_mode.flag_control_position_enabled ||
 		_control_mode.flag_control_climb_rate_enabled ||
@@ -702,7 +730,7 @@ MulticopterPositionControl::start_flight_task()
 	}
 
 	// Auto-follow me
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_FOLLOW_TARGET) {
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_FOLLOW_TARGET) {
 		int error = _flight_tasks.switchTask(FlightTaskIndex::AutoFollowMe);
 
 		if (error != 0) {
@@ -710,8 +738,15 @@ MulticopterPositionControl::start_flight_task()
 			task_failure = true;
 		}
 
-	} else if (_control_mode.flag_control_auto_enabled) {
-		// Auto relate maneuvers
+	}
+
+	// Auto related maneuvers
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_MISSION ||
+	    _commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_LOITER ||
+	    _commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_RTL ||
+	    _commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_TAKEOFF ||
+	    _commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_LAND ||
+	    _commander_state.main_state == commander_state_s::MAIN_STATE_AUTO_PRECLAND) {
 		int error = _flight_tasks.switchTask(FlightTaskIndex::AutoLine);
 
 		if (error != 0) {
@@ -720,8 +755,22 @@ MulticopterPositionControl::start_flight_task()
 		}
 	}
 
+	// custom flight task
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_CUSTOM) {
+		uint8_t cmd_result;
+		int error = _flight_tasks.switchTask(_vehicle_command, cmd_result);
+
+		if (error != 0) {
+			PX4_WARN("Custom command %d activation failed with error: %s", _vehicle_command.command,
+				 _flight_tasks.errorToString(error));
+			task_failure = true;
+		}
+
+		send_command_ack(_vehicle_command, cmd_result, error);
+	}
+
 	// manual position control
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_POSCTL || task_failure) {
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_POSCTL || task_failure) {
 
 		int error = 0;
 
@@ -753,7 +802,7 @@ MulticopterPositionControl::start_flight_task()
 	}
 
 	// manual altitude control
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_ALTCTL || task_failure) {
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_ALTCTL || task_failure) {
 		int error = _flight_tasks.switchTask(FlightTaskIndex::ManualAltitude);
 
 		if (error != 0) {
@@ -767,8 +816,8 @@ MulticopterPositionControl::start_flight_task()
 
 
 	// manual stabilized control
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_MANUAL
-	    ||  _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_STAB || task_failure) {
+	if (_commander_state.main_state == commander_state_s::MAIN_STATE_MANUAL
+	    ||  _commander_state.main_state == commander_state_s::MAIN_STATE_STAB || task_failure) {
 		int error = _flight_tasks.switchTask(FlightTaskIndex::ManualStabilized);
 
 		if (error != 0) {
@@ -940,6 +989,27 @@ MulticopterPositionControl::start()
 	}
 
 	return OK;
+}
+
+void MulticopterPositionControl::send_command_ack(const vehicle_command_s &command, const uint8_t &cmd_result,
+		const int &switch_result)
+{
+	// send back acknowledgment
+	vehicle_command_ack_s command_ack = {};
+	command_ack.command = command.command;
+	command_ack.result = cmd_result;
+	command_ack.result_param1 = switch_result;
+	command_ack.target_system = command.source_system;
+	command_ack.target_component = command.source_component;
+
+	if (_pub_vehicle_command_ack == nullptr) {
+		_pub_vehicle_command_ack = orb_advertise_queue(ORB_ID(vehicle_command_ack), &command_ack,
+					   vehicle_command_ack_s::ORB_QUEUE_LENGTH);
+
+	} else {
+		orb_publish(ORB_ID(vehicle_command_ack), _pub_vehicle_command_ack, &command_ack);
+
+	}
 }
 
 int mc_pos_control_main(int argc, char *argv[])

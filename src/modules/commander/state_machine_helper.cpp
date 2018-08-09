@@ -350,6 +350,13 @@ main_state_transition(const vehicle_status_s &status, const main_state_t new_mai
 
 		break;
 
+	case commander_state_s::MAIN_STATE_CUSTOM:
+
+		// checks will be done in flight tasks
+		ret = TRANSITION_CHANGED;
+
+		break;
+
 	case commander_state_s::MAIN_STATE_MAX:
 	default:
 		break;
